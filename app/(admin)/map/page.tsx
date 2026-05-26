@@ -30,6 +30,7 @@ interface DriverLocation {
 interface Vendor {
   id: string;
   storeName: string;
+  storeType: string;
   location: { latitude: number; longitude: number };
   address: string;
   isOpen: boolean;
@@ -203,6 +204,7 @@ export default function OperationsMapPage() {
           vendorData.push({
             id: doc.id,
             storeName: data.storeName || "Store",
+            storeType: data.storeType || "Store",
             location: data.location,
             address: data.address || "",
             isOpen: data.isOpen ?? false,
