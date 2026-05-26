@@ -4,17 +4,20 @@ import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import {
   LayoutDashboard, Store, ShoppingBag, Package,
-  Users, LogOut, ChevronRight, Image
+  Users, LogOut, ChevronRight, Image, Car, Map as MapIcon, Settings
 } from 'lucide-react'
 import { useAuth } from '@/lib/auth-context'
 
 const nav = [
   { label: 'Dashboard',  href: '/dashboard',  icon: LayoutDashboard },
+  { label: 'Live Map',   href: '/map',       icon: MapIcon },
   { label: 'Vendors',    href: '/vendors',     icon: Store },
   { label: 'Orders',     href: '/orders',      icon: ShoppingBag },
   { label: 'Products',   href: '/products',    icon: Package },
   { label: 'Users',      href: '/users',       icon: Users },
+  { label: 'Drivers',    href: '/drivers',     icon: Car },
   { label: 'Banners',    href: '/banners',     icon: Image },
+  { label: 'Settings',   href: '/settings',    icon: Settings },
 ]
 
 export default function Sidebar() {
