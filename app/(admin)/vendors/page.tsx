@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react'
 import { collection, onSnapshot, doc, updateDoc, serverTimestamp } from 'firebase/firestore'
-import { db } from '@/lib/firebase'
+import { getFunctions, httpsCallable } from 'firebase/functions'
+import firebaseApp, { db } from '@/lib/firebase'
 import { useSearchParams } from 'next/navigation'
-import { Check, X, Eye, MapPin, Building2 } from 'lucide-react'
+import { Check, X, Eye, MapPin, Building2, RefreshCw, AlertTriangle } from 'lucide-react'
 import StatusBadge from '@/components/StatusBadge'
 import Link from 'next/link'
 
@@ -19,7 +20,17 @@ interface Vendor {
   deliveryTime: string
   createdAt: { toDate?: () => Date } | null
   bankDetails?: { bankName?: string; accountNumber?: string }
+  paystackSubaccountCode?: string
+  paystackStatus?: 'active' | 'error'
+  paystackError?: string
+  paystackErrorStage?: string
 }
+
+const functions = getFunctions(firebaseApp, 'us-central1')
+const retryVendorSubaccount = httpsCallable<{ vendorId: string }, { ok: boolean; subaccountCode?: string }>(
+  functions,
+  'retryVendorSubaccount',
+)
 
 export default function VendorsPage() {
   const [vendors, setVendors] = useState<Vendor[]>([])
@@ -43,6 +54,19 @@ export default function VendorsPage() {
       status,
       updatedAt: serverTimestamp(),
     })
+  }
+
+  const [retrying, setRetrying] = useState<Record<string, boolean>>({})
+  async function retryPaystack(id: string) {
+    setRetrying(r => ({ ...r, [id]: true }))
+    try {
+      const res = await retryVendorSubaccount({ vendorId: id })
+      alert(`Subaccount linked: ${res.data.subaccountCode}`)
+    } catch (e) {
+      alert((e as { message?: string }).message ?? 'Retry failed')
+    } finally {
+      setRetrying(r => ({ ...r, [id]: false }))
+    }
   }
 
   const filtered = filter === 'all'
@@ -126,7 +150,24 @@ export default function VendorsPage() {
                     <p className="text-xs text-zinc-400">{vendor.bankDetails?.accountNumber ? `****${vendor.bankDetails.accountNumber.slice(-4)}` : '—'}</p>
                   </td>
                   <td className="px-6 py-4">
-                    <StatusBadge status={vendor.status} />
+                    <div className="flex flex-col gap-1.5">
+                      <StatusBadge status={vendor.status} />
+                      {vendor.paystackStatus === 'active' && (
+                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-green-700 uppercase tracking-wide">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                          Paystack linked
+                        </span>
+                      )}
+                      {vendor.paystackStatus === 'error' && (
+                        <div
+                          className="inline-flex items-start gap-1.5 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1 max-w-[240px]"
+                          title={vendor.paystackError}
+                        >
+                          <AlertTriangle size={12} className="mt-0.5 flex-shrink-0" />
+                          <span className="truncate">Paystack: {vendor.paystackError}</span>
+                        </div>
+                      )}
+                    </div>
                   </td>
                   <td className="px-6 py-4">
                     <div className="flex items-center justify-end gap-2">
@@ -152,6 +193,16 @@ export default function VendorsPage() {
                             <X size={13} /> Reject
                           </button>
                         </>
+                      )}
+                      {vendor.paystackStatus === 'error' && (
+                        <button
+                          onClick={() => retryPaystack(vendor.id)}
+                          disabled={retrying[vendor.id]}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-50 transition-colors text-xs font-semibold"
+                        >
+                          <RefreshCw size={13} className={retrying[vendor.id] ? 'animate-spin' : ''} />
+                          {retrying[vendor.id] ? 'Retrying…' : 'Retry Paystack'}
+                        </button>
                       )}
                       {vendor.status === 'active' && (
                         <button

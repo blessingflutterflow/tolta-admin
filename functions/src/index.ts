@@ -10,22 +10,15 @@ const db = admin.firestore()
 const PAYSTACK_KEY = process.env.PAYSTACK_SECRET_KEY || ''
 const PAYSTACK_API = 'https://api.paystack.co'
 
-// ─── Bank code lookup (SA banks on Paystack) ──────────────────────────────────
-const BANK_CODES: Record<string, string> = {
-  'Capitec':        '470010',
-  'FNB':            '250655',
-  'Standard Bank':  '051001',
-  'Absa':           '632005',
-  'Nedbank':        '198765',
-  'African Bank':   '430000',
-  'TymeBank':       '678910',
-  'Discovery Bank': '679000',
-}
-
 // ─── Paystack helpers ─────────────────────────────────────────────────────────
 const paystackHeaders = {
   Authorization: `Bearer ${PAYSTACK_KEY}`,
   'Content-Type': 'application/json',
+}
+
+async function paystackGet(path: string) {
+  const res = await axios.get(`${PAYSTACK_API}${path}`, { headers: paystackHeaders })
+  return res.data
 }
 
 async function paystackPost(path: string, body: object) {
@@ -36,6 +29,57 @@ async function paystackPost(path: string, body: object) {
 async function paystackPut(path: string, body: object) {
   const res = await axios.put(`${PAYSTACK_API}${path}`, body, { headers: paystackHeaders })
   return res.data
+}
+
+// ─── Bank list (fetched live from Paystack, cached 24 h) ──────────────────────
+type PaystackBank = { name: string; slug: string; code: string; currency: string }
+let bankCache: { fetched: number; banks: PaystackBank[] } | null = null
+const BANK_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+
+async function getSaBanks(): Promise<PaystackBank[]> {
+  if (bankCache && Date.now() - bankCache.fetched < BANK_CACHE_TTL_MS) {
+    return bankCache.banks
+  }
+  const result = await paystackGet('/bank?country=south africa&currency=ZAR')
+  if (!result.status) throw new Error('Failed to fetch bank list from Paystack')
+  bankCache = { fetched: Date.now(), banks: result.data as PaystackBank[] }
+  return bankCache.banks
+}
+
+/** Find bank code by fuzzy-matching the user-provided bank name. */
+async function findBankCode(bankName: string): Promise<string | null> {
+  if (!bankName) return null
+  const banks = await getSaBanks()
+  const needle = bankName.trim().toLowerCase()
+  // Exact match first
+  const exact = banks.find(b => b.name.toLowerCase() === needle)
+  if (exact) return exact.code
+  // Slug match
+  const bySlug = banks.find(b => b.slug.toLowerCase() === needle.replace(/\s+/g, '-'))
+  if (bySlug) return bySlug.code
+  // Substring — "Absa" matches "Absa Bank", "FNB" matches "First National Bank"
+  const partial = banks.find(b =>
+    b.name.toLowerCase().includes(needle) || needle.includes(b.name.toLowerCase().split(' ')[0])
+  )
+  return partial?.code ?? null
+}
+
+/** Verify an account number against a bank. Returns { name } on success or throws. */
+async function resolveAccount(accountNumber: string, bankCode: string): Promise<{ accountName: string }> {
+  const result = await paystackGet(
+    `/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${bankCode}`,
+  )
+  if (!result.status) throw new Error(result.message || 'Account resolution failed')
+  return { accountName: (result.data.account_name as string).trim() }
+}
+
+/** Loose name comparison — Paystack returns uppercase; providers use different orderings. */
+function namesRoughlyMatch(provided: string, resolved: string): boolean {
+  const norm = (s: string) => s.toUpperCase().replace(/[^A-Z ]/g, '').split(/\s+/).filter(w => w.length >= 3)
+  const p = new Set(norm(provided))
+  const r = norm(resolved)
+  // At least one word ≥3 chars overlaps
+  return r.some(w => p.has(w))
 }
 
 // ─── FCM helpers ──────────────────────────────────────────────────────────────
@@ -90,8 +134,91 @@ async function sendFCMToDriver(driverId: string, title: string, body: string, da
   }
 }
 
-// ─── 1. createVendorSubaccount ────────────────────────────────────────────────
-// Triggered when admin approves a vendor (status: pending → active)
+// ─── 1a. Subaccount creation core (used by trigger + admin retry) ─────────────
+// Returns { ok: true } if the subaccount was created (or already existed),
+// otherwise { ok: false, error, stage } with a human-readable reason.
+type SubaccountResult =
+  | { ok: true; subaccountCode: string; resolvedAccountName: string }
+  | { ok: false; error: string; stage: 'bank_lookup' | 'account_resolve' | 'name_mismatch' | 'paystack_create' }
+
+async function createSubaccountForVendor(
+  vendorRef: FirebaseFirestore.DocumentReference,
+  vendor: FirebaseFirestore.DocumentData,
+): Promise<SubaccountResult> {
+  const bankName      = vendor.bankDetails?.bankName as string | undefined
+  const accountNumber = vendor.bankDetails?.accountNumber as string | undefined
+  const accountName   = vendor.bankDetails?.accountName as string | undefined
+
+  if (!bankName || !accountNumber || !accountName) {
+    return { ok: false, error: 'Bank details incomplete on vendor profile.', stage: 'bank_lookup' }
+  }
+
+  // 1. Look up bank code from live Paystack bank list
+  let bankCode: string | null
+  try {
+    bankCode = await findBankCode(bankName)
+  } catch (e) {
+    return { ok: false, error: `Could not fetch bank list: ${(e as Error).message}`, stage: 'bank_lookup' }
+  }
+  if (!bankCode) {
+    return { ok: false, error: `"${bankName}" is not supported by Paystack in South Africa.`, stage: 'bank_lookup' }
+  }
+
+  // 2. Resolve account number to verify it exists at that bank
+  let resolved: { accountName: string }
+  try {
+    resolved = await resolveAccount(accountNumber, bankCode)
+  } catch (e) {
+    const raw = (e as { response?: { data?: { message?: string } }; message?: string })
+    const msg = raw.response?.data?.message ?? raw.message ?? 'Account resolution failed'
+    return { ok: false, error: `Bank account could not be verified: ${msg}`, stage: 'account_resolve' }
+  }
+
+  // 3. Sanity-check the resolved name against what the vendor entered
+  if (!namesRoughlyMatch(accountName, resolved.accountName)) {
+    return {
+      ok: false,
+      error: `Account name mismatch. Entered "${accountName}" — bank returned "${resolved.accountName}".`,
+      stage: 'name_mismatch',
+    }
+  }
+
+  // 4. Create the Paystack subaccount
+  try {
+    const vendorShare = Math.round((1 - (vendor.commissionRate ?? 0.10)) * 100)
+    const result = await paystackPost('/subaccount', {
+      business_name:       vendor.storeName,
+      settlement_bank:     bankCode,
+      account_number:      accountNumber,
+      percentage_charge:   vendorShare,
+      settlement_schedule: 'auto',
+      description:         `${vendor.storeName} — Tolta vendor`,
+    })
+    if (!result.status || !result.data?.subaccount_code) {
+      return { ok: false, error: result.message || 'Paystack refused subaccount creation.', stage: 'paystack_create' }
+    }
+
+    await vendorRef.update({
+      paystackSubaccountCode: result.data.subaccount_code,
+      paystackSubaccountId:   result.data.id,
+      paystackResolvedName:   resolved.accountName,
+      paystackStatus:         'active',
+      paystackError:          admin.firestore.FieldValue.delete(),
+      paystackErrorStage:     admin.firestore.FieldValue.delete(),
+      paystackUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
+    })
+
+    return { ok: true, subaccountCode: result.data.subaccount_code, resolvedAccountName: resolved.accountName }
+  } catch (e) {
+    const raw = (e as { response?: { data?: { message?: string } }; message?: string })
+    const msg = raw.response?.data?.message ?? raw.message ?? 'Unknown error'
+    return { ok: false, error: `Paystack API error: ${msg}`, stage: 'paystack_create' }
+  }
+}
+
+// ─── 1b. createVendorSubaccount (Firestore trigger) ───────────────────────────
+// Fires when admin flips status: pending → active. Delegates to the shared core
+// so we can reuse the same logic for admin-initiated retries.
 export const createVendorSubaccount = onDocumentUpdated(
   'vendors/{vendorId}',
   async (event) => {
@@ -99,49 +226,103 @@ export const createVendorSubaccount = onDocumentUpdated(
     const after  = event.data?.after.data()
     if (!before || !after) return
 
-    // Only fire when status changes to 'active' for the first time
+    // Only fire when status just changed to 'active'
     if (before.status === after.status) return
     if (after.status !== 'active') return
-    if (after.paystackSubaccountCode) return // already created
+    if (after.paystackSubaccountCode) return // already wired up
 
-    const bankCode = BANK_CODES[after.bankDetails?.bankName]
-    if (!bankCode) {
-      console.error(`Unknown bank: ${after.bankDetails?.bankName}`)
+    const result = await createSubaccountForVendor(event.data!.after.ref, after)
+
+    if (result.ok) {
+      console.log(`Subaccount created for ${after.storeName}: ${result.subaccountCode}`)
+      await sendFCMToVendor(
+        event.params.vendorId,
+        '🎉 You\'re approved!',
+        'Your Tolta vendor account is live. Start adding products!',
+        { type: 'vendor_approved' },
+      )
       return
     }
 
-    try {
-      const vendorShare = Math.round((1 - (after.commissionRate ?? 0.10)) * 100)
-
-      const result = await paystackPost('/subaccount', {
-        business_name:       after.storeName,
-        settlement_bank:     bankCode,
-        account_number:      after.bankDetails.accountNumber,
-        percentage_charge:   vendorShare,
-        settlement_schedule: 'auto', // T+1 — vendor gets paid same time as Tolta
-        description:         `${after.storeName} — Tolta vendor`,
-      })
-
-      if (result.status) {
-        await event.data!.after.ref.update({
-          paystackSubaccountCode: result.data.subaccount_code,
-          paystackSubaccountId:   result.data.id,
-          paystackUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
-        })
-        console.log(`Subaccount created for ${after.storeName}: ${result.data.subaccount_code}`)
-
-        // Notify vendor
-        await sendFCMToVendor(
-          event.params.vendorId,
-          '🎉 You\'re approved!',
-          'Your Tolta vendor account is live. Start adding products!',
-          { type: 'vendor_approved' }
-        )
-      }
-    } catch (e) {
-      console.error('Subaccount creation failed:', e)
-    }
+    // Roll status back so this vendor appears in the admin "needs attention" queue
+    console.error(`Subaccount creation failed for ${event.params.vendorId} [${result.stage}]: ${result.error}`)
+    await event.data!.after.ref.update({
+      status:             'pending_review',
+      paystackStatus:     'error',
+      paystackError:      result.error,
+      paystackErrorStage: result.stage,
+      paystackUpdatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+    })
   }
+)
+
+// ─── 1c. retryVendorSubaccount (callable, admin-only) ─────────────────────────
+// Lets the admin dashboard re-attempt subaccount creation after fixing bank
+// details on the vendor. Enforces the caller is an authenticated admin.
+export const retryVendorSubaccount = onCall<{ vendorId: string }>(
+  { region: 'us-central1' },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Sign in as admin.')
+    }
+    const { vendorId } = request.data
+    if (!vendorId) throw new HttpsError('invalid-argument', 'vendorId required.')
+
+    const vendorRef = db.collection('vendors').doc(vendorId)
+    const snap = await vendorRef.get()
+    if (!snap.exists) throw new HttpsError('not-found', 'Vendor not found.')
+
+    const vendor = snap.data()!
+    if (vendor.paystackSubaccountCode) {
+      return { ok: true, alreadyLinked: true, subaccountCode: vendor.paystackSubaccountCode }
+    }
+
+    // Ensure the vendor is at least approved (or was, before rollback)
+    if (!['active', 'pending_review'].includes(vendor.status)) {
+      throw new HttpsError('failed-precondition', `Cannot retry — vendor status is "${vendor.status}".`)
+    }
+
+    const result = await createSubaccountForVendor(vendorRef, vendor)
+    if (!result.ok) {
+      await vendorRef.update({
+        paystackStatus:     'error',
+        paystackError:      result.error,
+        paystackErrorStage: result.stage,
+        paystackUpdatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+      })
+      throw new HttpsError('failed-precondition', result.error)
+    }
+
+    // If we're recovering from a rollback, bring status back to 'active'
+    if (vendor.status !== 'active') {
+      await vendorRef.update({ status: 'active' })
+    }
+
+    await sendFCMToVendor(
+      vendorId,
+      '🎉 You\'re approved!',
+      'Your Tolta vendor account is live. Start adding products!',
+      { type: 'vendor_approved' },
+    )
+
+    return { ok: true, subaccountCode: result.subaccountCode, resolvedName: result.resolvedAccountName }
+  },
+)
+
+// ─── 1d. listSaBanks (callable, no auth) ──────────────────────────────────────
+// Used by the Flutter vendor onboarding form to populate the bank dropdown from
+// Paystack's live list, so it always matches what the CF will accept.
+export const listSaBanks = onCall<Record<string, never>>(
+  { region: 'us-central1' },
+  async () => {
+    const banks = await getSaBanks()
+    return {
+      banks: banks
+        .filter(b => b.currency === 'ZAR')
+        .map(b => ({ name: b.name, code: b.code, slug: b.slug }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    }
+  },
 )
 
 // ─── 2. initializePayment ─────────────────────────────────────────────────────
