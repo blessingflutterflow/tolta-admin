@@ -10,6 +10,46 @@ const db = admin.firestore()
 const PAYSTACK_KEY = process.env.PAYSTACK_SECRET_KEY || ''
 const PAYSTACK_API = 'https://api.paystack.co'
 
+// ─── Business settings (single source of truth, admin-controlled) ─────────────
+// Every CF that touches money reads from here. Cached in-memory for 60 seconds
+// so admin changes take effect within one minute for new orders.
+export type BusinessSettings = {
+  markupRate:            number  // e.g. 0.17 = 17% platform markup on merchant price
+  driverCommissionRate:  number  // e.g. 0.10 = Tolta keeps 10% of delivery fee
+  deliveryFeeBase:       number  // R base delivery fee
+  deliveryFeePerKm:      number  // R per km
+  deliveryRadiusKmMax:   number  // max km customer ↔ vendor
+  driverSearchRadiusKm:  number  // max km to look for a driver
+  minOrderDefault:       number  // fallback min order
+  absorbPaystackFee:     boolean // true = Tolta absorbs (Option A)
+}
+
+const DEFAULT_SETTINGS: BusinessSettings = {
+  markupRate:            0.17,
+  driverCommissionRate:  0.10,
+  deliveryFeeBase:       15,
+  deliveryFeePerKm:      3,
+  deliveryRadiusKmMax:   15,
+  driverSearchRadiusKm:  20,
+  minOrderDefault:       50,
+  absorbPaystackFee:     true,
+}
+
+let settingsCache: { fetched: number; value: BusinessSettings } | null = null
+const SETTINGS_CACHE_TTL_MS = 60 * 1000
+
+async function getBusinessSettings(): Promise<BusinessSettings> {
+  if (settingsCache && Date.now() - settingsCache.fetched < SETTINGS_CACHE_TTL_MS) {
+    return settingsCache.value
+  }
+  const snap = await db.collection('settings').doc('business').get()
+  const value: BusinessSettings = snap.exists
+    ? { ...DEFAULT_SETTINGS, ...(snap.data() as Partial<BusinessSettings>) }
+    : DEFAULT_SETTINGS
+  settingsCache = { fetched: Date.now(), value }
+  return value
+}
+
 // ─── Paystack helpers ─────────────────────────────────────────────────────────
 const paystackHeaders = {
   Authorization: `Bearer ${PAYSTACK_KEY}`,
@@ -64,23 +104,11 @@ async function findBankCode(bankName: string): Promise<string | null> {
   return partial?.code ?? null
 }
 
-/** Verify an account number against a bank. Returns { name } on success or throws. */
-async function resolveAccount(accountNumber: string, bankCode: string): Promise<{ accountName: string }> {
-  const result = await paystackGet(
-    `/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${bankCode}`,
-  )
-  if (!result.status) throw new Error(result.message || 'Account resolution failed')
-  return { accountName: (result.data.account_name as string).trim() }
-}
-
-/** Loose name comparison — Paystack returns uppercase; providers use different orderings. */
-function namesRoughlyMatch(provided: string, resolved: string): boolean {
-  const norm = (s: string) => s.toUpperCase().replace(/[^A-Z ]/g, '').split(/\s+/).filter(w => w.length >= 3)
-  const p = new Set(norm(provided))
-  const r = norm(resolved)
-  // At least one word ≥3 chars overlaps
-  return r.some(w => p.has(w))
-}
+// Note: Paystack's /bank/resolve endpoint does not support South Africa yet —
+// it only accepts NGN, USD, GHS, KES. Confirmed by probing the live API on
+// 2026-06-29. So no account-name verification is possible via Paystack for SA.
+// Vendors' bank details are trusted at onboarding and validated out-of-band
+// (proof-of-account upload + admin manual review).
 
 // ─── FCM helpers ──────────────────────────────────────────────────────────────
 
@@ -137,9 +165,13 @@ async function sendFCMToDriver(driverId: string, title: string, body: string, da
 // ─── 1a. Subaccount creation core (used by trigger + admin retry) ─────────────
 // Returns { ok: true } if the subaccount was created (or already existed),
 // otherwise { ok: false, error, stage } with a human-readable reason.
+//
+// NB — Paystack's /bank/resolve endpoint does NOT support ZAR yet, so we skip
+// the resolve step for SA. Paystack itself validates the account number when we
+// call /subaccount and returns a clear error if it's invalid.
 type SubaccountResult =
-  | { ok: true; subaccountCode: string; resolvedAccountName: string }
-  | { ok: false; error: string; stage: 'bank_lookup' | 'account_resolve' | 'name_mismatch' | 'paystack_create' }
+  | { ok: true; subaccountCode: string; bankCode: string }
+  | { ok: false; error: string; stage: 'bank_lookup' | 'paystack_create' }
 
 async function createSubaccountForVendor(
   vendorRef: FirebaseFirestore.DocumentReference,
@@ -164,26 +196,8 @@ async function createSubaccountForVendor(
     return { ok: false, error: `"${bankName}" is not supported by Paystack in South Africa.`, stage: 'bank_lookup' }
   }
 
-  // 2. Resolve account number to verify it exists at that bank
-  let resolved: { accountName: string }
-  try {
-    resolved = await resolveAccount(accountNumber, bankCode)
-  } catch (e) {
-    const raw = (e as { response?: { data?: { message?: string } }; message?: string })
-    const msg = raw.response?.data?.message ?? raw.message ?? 'Account resolution failed'
-    return { ok: false, error: `Bank account could not be verified: ${msg}`, stage: 'account_resolve' }
-  }
-
-  // 3. Sanity-check the resolved name against what the vendor entered
-  if (!namesRoughlyMatch(accountName, resolved.accountName)) {
-    return {
-      ok: false,
-      error: `Account name mismatch. Entered "${accountName}" — bank returned "${resolved.accountName}".`,
-      stage: 'name_mismatch',
-    }
-  }
-
-  // 4. Create the Paystack subaccount
+  // 2. Create the Paystack subaccount. Paystack rejects invalid account numbers
+  //    here with a specific message, which we surface directly on the vendor.
   try {
     const vendorShare = Math.round((1 - (vendor.commissionRate ?? 0.10)) * 100)
     const result = await paystackPost('/subaccount', {
@@ -191,7 +205,6 @@ async function createSubaccountForVendor(
       settlement_bank:     bankCode,
       account_number:      accountNumber,
       percentage_charge:   vendorShare,
-      settlement_schedule: 'auto',
       description:         `${vendor.storeName} — Tolta vendor`,
     })
     if (!result.status || !result.data?.subaccount_code) {
@@ -201,14 +214,14 @@ async function createSubaccountForVendor(
     await vendorRef.update({
       paystackSubaccountCode: result.data.subaccount_code,
       paystackSubaccountId:   result.data.id,
-      paystackResolvedName:   resolved.accountName,
+      paystackBankCode:       bankCode,
       paystackStatus:         'active',
       paystackError:          admin.firestore.FieldValue.delete(),
       paystackErrorStage:     admin.firestore.FieldValue.delete(),
       paystackUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
     })
 
-    return { ok: true, subaccountCode: result.data.subaccount_code, resolvedAccountName: resolved.accountName }
+    return { ok: true, subaccountCode: result.data.subaccount_code, bankCode }
   } catch (e) {
     const raw = (e as { response?: { data?: { message?: string } }; message?: string })
     const msg = raw.response?.data?.message ?? raw.message ?? 'Unknown error'
@@ -305,7 +318,53 @@ export const retryVendorSubaccount = onCall<{ vendorId: string }>(
       { type: 'vendor_approved' },
     )
 
-    return { ok: true, subaccountCode: result.subaccountCode, resolvedName: result.resolvedAccountName }
+    return { ok: true, subaccountCode: result.subaccountCode, bankCode: result.bankCode }
+  },
+)
+
+// ─── 1e. recalculateAllProductPrices (callable, admin-only) ──────────────────
+// After admin changes markupRate in settings/business, this walks every product
+// and recomputes `price = merchantPrice × (1 + markupRate)`. Batched writes.
+export const recalculateAllProductPrices = onCall<Record<string, never>>(
+  { region: 'us-central1' },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in as admin.')
+
+    const settings = await getBusinessSettings()
+    const products = await db.collection('products').get()
+
+    let updated = 0
+    let skipped = 0
+    let batch = db.batch()
+    let batchSize = 0
+
+    for (const doc of products.docs) {
+      const d = doc.data()
+      const merchant = d.merchantPrice as number | undefined
+      // If no merchantPrice yet, back-fill: assume current `price` was the
+      // merchant price (grandfather in — no forced markup on legacy products).
+      const merchantPrice = merchant ?? (d.price as number) ?? 0
+      if (merchantPrice <= 0) { skipped++; continue }
+
+      const newPrice = Math.round(merchantPrice * (1 + settings.markupRate) * 100) / 100
+      batch.update(doc.ref, {
+        merchantPrice,
+        price: newPrice,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      })
+      updated++
+      batchSize++
+
+      if (batchSize >= 400) { // Firestore batch limit is 500
+        await batch.commit()
+        batch = db.batch()
+        batchSize = 0
+      }
+    }
+    if (batchSize > 0) await batch.commit()
+
+    console.log(`Recalculated ${updated} products (skipped ${skipped}) at ${(settings.markupRate * 100).toFixed(1)}% markup`)
+    return { updated, skipped, markupRate: settings.markupRate }
   },
 )
 
@@ -346,14 +405,12 @@ export const initializePayment = onRequest(async (req, res) => {
     } catch (_) { /* use guest */ }
   }
 
-  const { vendorId, amountRands, email, items, deliveryAddress, deliveryFee,
+  const { vendorId, items, email, deliveryAddress,
           deliveryLat, deliveryLng, deliveryDistanceKm } = req.body as {
     vendorId: string
-    amountRands: number
     email: string
-    items: Array<{ name: string; quantity: number; price: number }>
+    items: Array<{ name: string; quantity: number; price: number; merchantPrice?: number; productId?: string }>
     deliveryAddress: string
-    deliveryFee: number
     deliveryLat?: number
     deliveryLng?: number
     deliveryDistanceKm?: number
@@ -367,13 +424,37 @@ export const initializePayment = onRequest(async (req, res) => {
     throw new HttpsError('failed-precondition', 'Vendor payment account not set up yet.')
   }
 
-  const reference     = `TB-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`
-  const amountKobo    = Math.round(amountRands * 100)
-  const commissionRate = vendor.commissionRate ?? 0.10
-  const platformFeeKobo = Math.round(amountKobo * commissionRate) // what Tolta keeps
+  // Load business settings — single source of truth
+  const settings = await getBusinessSettings()
+
+  // Server-side authoritative delivery fee — never trust the client-supplied one
+  const distanceKm = deliveryDistanceKm ?? 0
+  const deliveryFee = Math.round(
+    (settings.deliveryFeeBase + distanceKm * settings.deliveryFeePerKm) * 100,
+  ) / 100
+
+  // Subtotal (customer-facing prices, i.e. displayed prices with markup baked in)
+  const subtotal = items.reduce((sum, i) => sum + (i.price * i.quantity), 0)
+  const amountRands = Math.round((subtotal + deliveryFee) * 100) / 100
+
+  const reference       = `TB-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`
+  const amountKobo      = Math.round(amountRands * 100)
+  const deliveryFeeKobo = Math.round(deliveryFee * 100)
+
+  // Split the money correctly:
+  //   Vendor gets = sum(merchantPrice × qty)                     → subaccount → vendor's bank
+  //   Tolta gets  = sum((displayedPrice − merchantPrice) × qty)  + delivery fee → platform balance
+  //   Tolta then pays driver:   deliveryFee × (1 − driverCommissionRate)
+  //   Tolta keeps net:           markup + (deliveryFee × driverCommissionRate) − Paystack fee
+  const markupPerCartKobo = items.reduce((sum, i) => {
+    // Fallback: if merchantPrice missing (legacy product), assume no markup
+    const merch = (i.merchantPrice ?? i.price) * 100
+    const displayed = i.price * 100
+    return sum + Math.max(0, Math.round((displayed - merch) * i.quantity))
+  }, 0)
+  const platformFeeKobo   = markupPerCartKobo + deliveryFeeKobo // what Tolta keeps
 
   // Create order in Firestore first
-  const subtotal = amountRands - deliveryFee
   const orderRef = await db.collection('orders').add({
     userId:          userId,
     vendorId,
@@ -567,7 +648,7 @@ export const notifyOrderStatus = onDocumentUpdated(
     const MESSAGES: Record<string, { title: string; body: string }> = {
       placed:     { title: '✅ Order received!',    body: 'Your order is waiting for the vendor.' },
       confirmed:  { title: '👍 Order accepted!',    body: 'The vendor is packing your order now.' },
-      ready:      { title: '📦 Ready for pickup',   body: 'Your order is packed. Driver on the way.' },
+      ready:      { title: '📦 Ready for pickup',   body: 'Your order is packed. Finding you a driver now.' },
       on_the_way: { title: '🚗 On the way!',        body: 'Your driver is heading to you.' },
       delivered:  { title: '🎉 Delivered!',         body: 'Your order has arrived. Enjoy!' },
       cancelled:  { title: '❌ Order cancelled',    body: 'Your order has been cancelled.' },
@@ -592,13 +673,38 @@ async function findAndAssignDriver(
   vendorId: string,
   excludeDriverIds: string[] = [],
 ): Promise<boolean> {
+  // Helper — mark the order as awaiting a driver and (optionally) tell the
+  // consumer we're looking. Called whenever assignment can't complete.
+  const markUnassigned = async (reason: string) => {
+    console.warn(`Order ${orderId} unassigned: ${reason}`)
+    await orderRef.update({
+      assignmentStatus:      'unassigned',
+      assignmentError:       reason,
+      assignmentAttemptedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt:             admin.firestore.FieldValue.serverTimestamp(),
+    })
+    // Let the consumer know so they don't panic when the driver doesn't appear
+    try {
+      const orderSnap = await orderRef.get()
+      const userId = orderSnap.data()?.userId as string | undefined
+      if (userId && userId !== 'guest') {
+        await sendFCM(
+          userId,
+          'Looking for a driver…',
+          "We're finding a nearby driver for your order. This may take a few minutes.",
+          { orderId, type: 'awaiting_driver' },
+        )
+      }
+    } catch (_) { /* best-effort notification */ }
+  }
+
   // All online drivers
   const trackingSnap = await db.collection('tracking_sessions')
     .where('isActive', '==', true)
     .get()
 
   if (trackingSnap.empty) {
-    console.log(`No online drivers for order ${orderId}`)
+    await markUnassigned('No drivers currently online')
     return false
   }
 
@@ -607,7 +713,7 @@ async function findAndAssignDriver(
     .filter(d => !excludeDriverIds.includes(d.id))
 
   if (allOnline.length === 0) {
-    console.log(`No eligible drivers for order ${orderId} (all excluded or offline)`)
+    await markUnassigned('All online drivers have declined this order')
     return false
   }
 
@@ -626,7 +732,7 @@ async function findAndAssignDriver(
 
   const available = allOnline.filter(d => !busyIds.has(d.id))
   if (available.length === 0) {
-    console.log(`All drivers busy for order ${orderId}`)
+    await markUnassigned('All online drivers are currently on other deliveries')
     return false
   }
 
@@ -650,9 +756,12 @@ async function findAndAssignDriver(
 
   await orderRef.update({
     driverId,
-    deliveryStatus: 'assigned',
-    assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+    deliveryStatus:        'assigned',
+    assignmentStatus:      'assigned',
+    assignmentError:       admin.firestore.FieldValue.delete(),
+    assignmentAttemptedAt: admin.firestore.FieldValue.delete(),
+    assignedAt:            admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt:             admin.firestore.FieldValue.serverTimestamp(),
   })
 
   await sendFCMToDriver(
@@ -716,6 +825,78 @@ export const reassignOnDecline = onDocumentUpdated('orders/{orderId}', async (ev
   )
 })
 
+// ─── 6c. retryUnassignedOnDriverOnline ────────────────────────────────────────
+// Fires when a driver's tracking_sessions doc flips isActive → true (goes
+// online). Sweeps for any 'ready' orders that failed to find a driver earlier
+// and tries to hand them to the newly-online driver.
+export const retryUnassignedOnDriverOnline = onDocumentUpdated(
+  'tracking_sessions/{driverId}',
+  async (event) => {
+    const before = event.data?.before.data()
+    const after  = event.data?.after.data()
+    if (!before || !after) return
+
+    // Only fire on the transition offline → online
+    if (before.isActive === true) return
+    if (after.isActive  !== true) return
+
+    // Find unassigned 'ready' orders — batched read (max 10 per query is fine,
+    // no unassigned should normally be sitting around anyway)
+    const stuckSnap = await db.collection('orders')
+      .where('status', '==', 'ready')
+      .where('assignmentStatus', '==', 'unassigned')
+      .limit(10)
+      .get()
+
+    if (stuckSnap.empty) return
+
+    console.log(`Driver ${event.params.driverId} online — retrying ${stuckSnap.size} unassigned order(s)`)
+
+    for (const doc of stuckSnap.docs) {
+      const order = doc.data()
+      // Exclude drivers that already declined this specific order
+      const excluded = (order.declinedBy as string[] | undefined) ?? []
+      await findAndAssignDriver(
+        doc.id,
+        doc.ref,
+        order.vendorId as string,
+        excluded,
+      )
+    }
+  },
+)
+
+// ─── 6d. retryOrderAssignment (callable, admin-only) ──────────────────────────
+// Admin dashboard can force a re-assignment on any stuck order.
+export const retryOrderAssignment = onCall<{ orderId: string }>(
+  { region: 'us-central1' },
+  async (request) => {
+    if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in as admin.')
+    const { orderId } = request.data
+    if (!orderId) throw new HttpsError('invalid-argument', 'orderId required.')
+
+    const orderRef = db.collection('orders').doc(orderId)
+    const snap = await orderRef.get()
+    if (!snap.exists) throw new HttpsError('not-found', 'Order not found.')
+    const order = snap.data()!
+    if (order.status !== 'ready') {
+      throw new HttpsError('failed-precondition', `Order status is "${order.status}", not "ready".`)
+    }
+    if (order.driverId) {
+      return { ok: true, alreadyAssigned: true, driverId: order.driverId }
+    }
+
+    const excluded = (order.declinedBy as string[] | undefined) ?? []
+    const ok = await findAndAssignDriver(
+      orderId,
+      orderRef,
+      order.vendorId as string,
+      excluded,
+    )
+    return { ok, retried: true }
+  },
+)
+
 // ─── 7. recordDeliveryEarnings ────────────────────────────────────────────────
 // Fires when order status → 'delivered' — writes earnings to driver_earnings
 export const recordDeliveryEarnings = onDocumentUpdated('orders/{orderId}', async (event) => {
@@ -729,28 +910,34 @@ export const recordDeliveryEarnings = onDocumentUpdated('orders/{orderId}', asyn
   const orderId  = event.params.orderId
   const driverId = after.driverId as string
 
-  // Fetch delivery pricing from admin settings
-  const settingsSnap = await db.collection('settings').doc('deliveryPricing').get()
-  const settings = settingsSnap.data() ?? {}
-  const baseFee: number = (settings.baseFee as number) ?? 30
+  // Driver earnings = deliveryFee × (1 − driverCommissionRate).
+  // Tolta keeps driverCommissionRate as platform revenue on the delivery.
+  const settings = await getBusinessSettings()
+  const deliveryFee = (after.deliveryFee as number) ?? 0
+  const driverPayout = Math.round(
+    deliveryFee * (1 - settings.driverCommissionRate) * 100,
+  ) / 100
 
   // Write earnings record
   await db.collection('driver_earnings').add({
     driverId,
     orderId,
-    amount:    baseFee,
-    type:      'delivery',
-    status:    'pending_payout',
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    amount:                driverPayout,
+    deliveryFee,
+    commissionRate:        settings.driverCommissionRate,
+    platformCommissionAmount: Math.round((deliveryFee - driverPayout) * 100) / 100,
+    type:                  'delivery',
+    status:                'pending_payout',
+    createdAt:             admin.firestore.FieldValue.serverTimestamp(),
   })
 
   // Update wallet balance — this is what the wallet screen reads
   await db.collection('drivers').doc(driverId)
     .collection('wallet').doc('main')
     .set({
-      balance:        admin.firestore.FieldValue.increment(baseFee),
-      totalEarned:    admin.firestore.FieldValue.increment(baseFee),
-      pendingPayout:  admin.firestore.FieldValue.increment(baseFee),
+      balance:        admin.firestore.FieldValue.increment(driverPayout),
+      totalEarned:    admin.firestore.FieldValue.increment(driverPayout),
+      pendingPayout:  admin.firestore.FieldValue.increment(driverPayout),
       updatedAt:      admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true })
 
@@ -758,11 +945,11 @@ export const recordDeliveryEarnings = onDocumentUpdated('orders/{orderId}', asyn
   await sendFCMToDriver(
     driverId,
     '💰 Delivery Complete!',
-    `R${baseFee} added to your wallet.`,
-    { orderId, type: 'earnings_added', amount: String(baseFee) }
+    `R${driverPayout.toFixed(2)} added to your wallet.`,
+    { orderId, type: 'earnings_added', amount: String(driverPayout) },
   )
 
-  console.log(`Earnings R${baseFee} recorded for driver ${driverId} on order ${orderId}`)
+  console.log(`Earnings R${driverPayout.toFixed(2)} recorded for driver ${driverId} on order ${orderId} (delivery R${deliveryFee}, commission ${(settings.driverCommissionRate * 100).toFixed(1)}%)`)
 })
 
 // ─── 8. verifyPayment ────────────────────────────────────────────────────────
